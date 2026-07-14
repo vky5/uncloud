@@ -25,6 +25,50 @@ Uncloud is made of a small set of cooperating processes. Each machine runs the s
 The daemon (`internal/daemon`) is a thin wrapper that starts a `machine.Machine` (`internal/machine/machine.go`), which
 wires together all the subsystems below.
 
+```mermaid
+graph TB
+    CLI["uc CLI"]
+
+    subgraph M1["Machine A"]
+        D1["uncloudd"]
+        WG1["WireGuard"]
+        DOCK1["Docker"]
+        COR1["Corrosion"]
+        DNS1["DNS server"]
+        CAD1["Caddy"]
+        D1 --- WG1
+        D1 --- DOCK1
+        D1 --- COR1
+        D1 --- DNS1
+        D1 -.optional.- CAD1
+    end
+
+    subgraph M2["Machine B"]
+        D2["uncloudd"]
+        WG2["WireGuard"]
+        DOCK2["Docker"]
+        COR2["Corrosion"]
+        DNS2["DNS server"]
+        CAD2["Caddy"]
+        D2 --- WG2
+        D2 --- DOCK2
+        D2 --- COR2
+        D2 --- DNS2
+        D2 -.optional.- CAD2
+    end
+
+    CLI -->|SSH / TCP / Unix socket + gRPC| D1
+    WG1 <-->|encrypted mesh tunnel| WG2
+    COR1 <-->|gossip replication| COR2
+    D1 <-->|grpc-proxy forwarding| D2
+
+    INET(("Internet"))
+    UDNS["Uncloud DNS (optional)"]
+    CAD1 --> INET
+    CAD2 --> INET
+    D1 -.-> UDNS
+```
+
 ## Network architecture
 
 Uncloud replaces the concept of a "cluster" with a "network" of machines, similar to Tailscale, but implemented as a
@@ -42,6 +86,26 @@ Talos's KubeSpan design, so machines behind firewalls or on different providers 
 
 When a new machine joins, it only needs to establish a WireGuard tunnel with one existing machine. The rest of the
 mesh learns about the new peer through the replicated cluster state and connects to it automatically.
+
+```mermaid
+graph LR
+    subgraph mesh["WireGuard mesh 10.210.0.0/16"]
+        subgraph subA["Machine A subnet 10.210.0.0/24"]
+            MA["Machine A\n10.210.0.1/32"]
+            CA1["Container\n10.210.0.2"]
+            CA2["Container\n10.210.0.3"]
+        end
+        subgraph subB["Machine B subnet 10.210.1.0/24"]
+            MB["Machine B\n10.210.1.1/32"]
+            CB1["Container\n10.210.1.2"]
+        end
+    end
+    MA <-->|WireGuard tunnel| MB
+    CA1 -.bridge network.- MA
+    CA2 -.bridge network.- MA
+    CB1 -.bridge network.- MB
+    CA1 <-->|direct, no NAT| CB1
+```
 
 ## State management
 
@@ -126,6 +190,96 @@ A representative walk-through of `uc run` / `uc deploy`, tying the pieces above 
 
 No step here requires a central coordinator: every machine involved is reacting to the same replicated state or to a
 direct request forwarded over the mesh.
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant CLI as uc CLI
+    participant DA as uncloudd (connected machine)
+    participant DB as uncloudd (target machine)
+    participant Docker as Docker (target)
+    participant Store as Corrosion (replicated state)
+    participant DNS as DNS servers (all machines)
+    participant Caddy as Caddy (ingress machines)
+
+    User->>CLI: uc run / uc deploy
+    CLI->>CLI: build execution plan
+    CLI->>DA: gRPC request (SSH/TCP/Unix socket)
+    DA->>DB: forward via grpc-proxy (if target is remote)
+    DB->>Docker: start container on bridge network
+    Docker-->>DB: container running, gets mesh IP
+    DB->>Store: write container/service record
+    Store-->>DNS: replicate state (gossip)
+    DNS->>DNS: update name -> IP records
+    Store-->>Caddy: replicate state (gossip)
+    Caddy->>Caddy: re-resolve upstreams via DNS, update routes/TLS
+    DB-->>DA: result
+    DA-->>CLI: result
+    CLI-->>User: status / endpoints
+```
+
+## Subsystem overview
+
+A tour of every package that makes up Uncloud, grouped by area.
+
+### Entry points (`cmd/`)
+
+| Package | Purpose |
+|---|---|
+| `cmd/uc` | The `uc` CLI binary: command tree for machine, service, volume, DNS, and context management. |
+| `cmd/uncloudd` | The machine daemon binary that runs on every cluster machine. |
+| `cmd/ucind` | "Uncloud in Docker": spins up local multi-machine clusters inside Docker containers for development and e2e testing. |
+
+### Machine daemon core (`internal/machine`)
+
+| Package | Purpose |
+|---|---|
+| `machine` (root) | Wires together networking, Docker, Corrosion, DNS, Caddy, and the gRPC API into one running machine process; owns machine startup/shutdown and persisted local state. |
+| `machine/api/pb` | Protobuf/gRPC definitions for the Machine, Cluster, Docker, and Caddy services exposed by every `uncloudd`. |
+| `machine/api/proxy` | Forwards gRPC calls transparently from the machine you're connected to, to any other machine in the cluster, using `grpc-proxy`. |
+| `machine/network` | Configures the WireGuard interface, allocates subnets, manages peers, keys, MTU, and NAT traversal/peer discovery. |
+| `machine/cluster` | Cluster-level state and operations: machine registry, IPAM (subnet allocation), and cluster-wide DNS bookkeeping. |
+| `machine/store` | Typed read/write layer over Corrosion for containers and other cluster records. |
+| `machine/corroservice` | Runs and configures the Corrosion database as a Docker-managed service on the machine. |
+| `machine/corromigrate` | Schema migrations for the Corrosion database. |
+| `machine/dns` | The embedded DNS server and resolver that answers machine/container/service name lookups from the replicated state. |
+| `machine/docker` | Wraps the local Docker daemon to create/inspect/manage containers, images, and the machine's bridge network. |
+| `machine/caddyconfig` | Generates and pushes Caddy configuration (Caddyfile/JSON) from the current set of services, and validates it against the Caddy admin API. |
+| `machine/firewall` | Manages iptables/pf rules needed for the WireGuard mesh and container networking. |
+| `machine/metrics` | Exposes Prometheus metrics for the machine daemon. |
+| `machine/osinfo` | Collects OS/platform information reported by the machine. |
+| `machine/constants` | Shared constants (paths, defaults) used across the machine packages. |
+
+### Daemon wrapper and platform glue (`internal/`)
+
+| Package | Purpose |
+|---|---|
+| `daemon` | Thin process wrapper used by `cmd/uncloudd`: starts a `machine.Machine` and signals readiness to systemd. |
+| `corrosion` | Client for talking to the Corrosion HTTP API (queries, subscriptions, admin operations). |
+| `dns` | Client for the optional external managed Uncloud DNS service that provisions `*.uncld.dev` records. |
+| `docker` | Shared, machine-agnostic Docker helpers used by both the daemon and CLI-side code. |
+| `proxy` | Generic TCP proxy used to tunnel local connections to a remote address (used for reaching a machine's Unix socket over SSH). |
+| `sshexec` | Executes commands and installs Uncloud on remote machines over SSH (used by `uc machine init`/`add`). |
+| `secret` | Cryptographic secret generation/handling helpers. |
+| `journal` | Reads and tails log entries (e.g. systemd journal) for `uc machine logs`. |
+| `log` | Structured logging setup shared across binaries. |
+| `metrics` | Declares the Prometheus metrics used throughout Uncloud. |
+| `grpcversion` | gRPC interceptor/helpers for exchanging and checking version compatibility between client and daemon. |
+| `gitutil` | Small git helpers used by build tooling. |
+| `fs` | Filesystem helpers (e.g. looking up UID/GID for the corrosion user). |
+| `version` | Build/version information embedded in binaries. |
+| `ucind` | Implementation behind `cmd/ucind`: provisions and manages "Uncloud in Docker" dev clusters. |
+| `cli` | CLI-side support code: local config file handling, TUI progress output, log formatting, shell completion, machine helpers. |
+
+### Public API and client (`pkg/`)
+
+| Package | Purpose |
+|---|---|
+| `pkg/api` | Public, stable types shared between the CLI/client and the daemon: service/container/volume/config/secret definitions, placement, ports, errors. |
+| `pkg/client` | The Go client library the CLI uses to talk to `uncloudd`: connecting, running containers, managing services/volumes/images/DNS, streaming logs. |
+| `pkg/client/connector` | Establishes the transport to a machine's gRPC API: over SSH, raw TCP, a local Unix socket, or directly over WireGuard. |
+| `pkg/client/deploy` | Core deployment engine: resolves what containers/volumes need to change and applies them with a chosen rollout strategy. |
+| `pkg/client/compose` | Translates Docker Compose projects into Uncloud service definitions and deployment plans (`uc deploy`). |
 
 ## Project layout reference
 
